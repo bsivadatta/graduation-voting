@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import LoginPage from './LoginPage';
 import Confetti from 'react-confetti';
-import { db } from './firebase'; // Import your Firestore db instance
+import { db, auth } from './firebase';
 import {
   collection,
   doc,
@@ -19,12 +19,13 @@ import {
   deleteField,
 } from 'firebase/firestore';
 import { v4 as uuidv4 } from 'uuid'; // For generating unique user IDs
+import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
 
 // localStorage keys
 const USER_ID_STORAGE_KEY = 'superlativesUserId';
 const USER_TYPE_STORAGE_KEY = 'superlativesUserType';
 
-// Firestore collection names
+// Firestore collection names and document IDs (moved back here)
 const GLOBAL_STATE_COLLECTION = 'globalState';
 const CURRENT_STATE_DOC = 'currentState';
 const SUPERLATIVES_COLLECTION = 'superlatives';
@@ -50,13 +51,15 @@ export default function App() {
 
   // Voting-related state
   const [localSelectedNominee, setLocalSelectedNominee] = useState(null); // User's selection in this tab
-  const [votesForCurrentSuperlative, setVotesForCurrentSuperlative] = useState({}); // { nomineeName: count }
+  const [nomineeVoteStats, setNomineeVoteStats] = useState({}); // { nomineeName: { score: X, graduatingVotes: Y, firstVoteTimestamp: Z } }
+  const [totalRawVotesCount, setTotalRawVotesCount] = useState(0); // New state for raw vote count for admin live view
   const [isVoting, setIsVoting] = useState(false); // To prevent rapid/double voting
 
   // UI state
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
   const [finalSummaryData, setFinalSummaryData] = useState(null);
   const [adminQrUrlInput, setAdminQrUrlInput] = useState(''); // Local input for admin to change QR URL
+  const [shuffledNominees, setShuffledNominees] = useState([]);
 
   // Persist userType and userId in localStorage
   useEffect(() => {
@@ -128,32 +131,59 @@ export default function App() {
   
   const currentSuperlative = superlativesList[currentQuestionIndex];
 
+  // Effect to shuffle nominees when currentSuperlative changes
+  useEffect(() => {
+    if (currentSuperlative && currentSuperlative.nominees && Array.isArray(currentSuperlative.nominees)) {
+      const newArray = [...currentSuperlative.nominees];
+      // Fisher-Yates shuffle
+      for (let i = newArray.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [newArray[i], newArray[j]] = [newArray[j], newArray[i]];
+      }
+      setShuffledNominees(newArray);
+    } else {
+      setShuffledNominees([]);
+    }
+  }, [currentSuperlative]);
+
   // Subscribe to votes for the current superlative
   useEffect(() => {
     if (!currentSuperlative?.id) {
-      setVotesForCurrentSuperlative({}); // Clear votes if no current superlative
+      setNomineeVoteStats({}); // Clear stats if no current superlative
+      setTotalRawVotesCount(0); // Clear raw count as well
       return;
     }
 
-    const q = query(collection(db, VOTES_COLLECTION), where('superlativeId', '==', currentSuperlative.id));
+    // Order by timestamp to process votes chronologically for firstVoteTimestamp
+    const q = query(collection(db, VOTES_COLLECTION), where('superlativeId', '==', currentSuperlative.id), orderBy('timestamp', 'asc'));
     const unsubscribe = onSnapshot(q, (querySnapshot) => {
-      const newVotes = {}; // Will store { nomineeName: weightedScore }
-      currentSuperlative.nominees.forEach(n => newVotes[n.name] = 0); // Initialize all nominees with 0 score
+      const newNomineeStats = {};
+      currentSuperlative.nominees.forEach(n => {
+        newNomineeStats[n.name] = { score: 0, graduatingVotes: 0, firstVoteTimestamp: null };
+      });
+
+      setTotalRawVotesCount(querySnapshot.size);
 
       querySnapshot.forEach((doc) => {
         const vote = doc.data();
-        let voteWeight = 0;
-        if (vote.userType === 'admin' || vote.userType === 'graduating') {
-          voteWeight = 1;
-        } else if (vote.userType === 'guest') {
-          voteWeight = 0.5;
-        }
+        const nomineeName = vote.nomineeName;
 
-        if (newVotes[vote.nomineeName] !== undefined) {
-          newVotes[vote.nomineeName] += voteWeight;
+        if (newNomineeStats[nomineeName] !== undefined) {
+          newNomineeStats[nomineeName].score += 1; // All votes have a weight of 1
+
+          if (vote.userType === 'graduating') {
+            newNomineeStats[nomineeName].graduatingVotes += 1;
+          }
+
+          // Set firstVoteTimestamp if it's the first vote for this nominee
+          // Firestore timestamps can be null if serverTimestamp() is used and not yet resolved
+          // Or they can be Firestore Timestamp objects.
+          if (!newNomineeStats[nomineeName].firstVoteTimestamp && vote.timestamp) {
+             newNomineeStats[nomineeName].firstVoteTimestamp = vote.timestamp.toDate ? vote.timestamp.toDate() : new Date(vote.timestamp);
+          }
         }
       });
-      setVotesForCurrentSuperlative(newVotes);
+      setNomineeVoteStats(newNomineeStats);
       
       // Update localSelectedNominee if this user has already voted on this question
       const userVoteDoc = querySnapshot.docs.find(d => d.data().userId === userId);
@@ -184,13 +214,18 @@ export default function App() {
     return () => window.removeEventListener('resize', updateDimensions);
   }, []);
 
-  const handleLogin = (type) => {
+  const handleLogin = (type, approvedId) => {
     setUserType(type);
-    if (!userId) { // Generate a userId if one doesn't exist
+    if (type === 'admin') {
+      // Admin logs in directly, generate their ID if it doesn't exist or is new session
+      if (!userId) { // Check if userId already exists from a previous session for admin
       setUserId(uuidv4());
+      }
+    } else {
+      // For guest/graduating, userId is pre-approved and passed in
+      setUserId(approvedId);
     }
-    // Global app state (currentQuestionIndex, isResultShown) is controlled by Firestore,
-    // so no need to reset it here directly. Login just sets the user's view.
+    // Global app state handled by Firestore, no client-side reset needed here beyond user identification.
   };
   
   const handleLogout = () => {
@@ -227,43 +262,62 @@ export default function App() {
   };
   
   const getWinner = useCallback(() => {
-    if (!currentSuperlative || Object.keys(votesForCurrentSuperlative).length === 0) return null;
+    if (!currentSuperlative || Object.keys(nomineeVoteStats).length === 0) return null;
 
-    let winners = [];
-    let maxVotes = 0; // Initialize to 0, as scores can be 0.5
+    // Create an array of nominee data objects from nomineeVoteStats
+    const nomineeDataForSorting = Object.entries(nomineeVoteStats)
+      .map(([name, stats]) => ({
+        name,
+        score: stats.score,
+        graduatingVotes: stats.graduatingVotes,
+        firstVoteTimestamp: stats.firstVoteTimestamp,
+      }))
+      .filter(n => n.score > 0); // Only consider nominees with actual votes
 
-    // First pass to find the maximum weighted score
-    for (const nomineeName in votesForCurrentSuperlative) {
-      if (votesForCurrentSuperlative[nomineeName] > maxVotes) {
-        maxVotes = votesForCurrentSuperlative[nomineeName];
+    if (nomineeDataForSorting.length === 0) return null;
+
+    // Sort nominees:
+    // 1. Score (descending)
+    // 2. Graduating Votes (descending)
+    // 3. First Vote Timestamp (ascending - earlier is better)
+    nomineeDataForSorting.sort((a, b) => {
+      if (b.score !== a.score) {
+        return b.score - a.score;
       }
-    }
-
-    // If the maximum vote is 0 (or less, though not expected here), no winner.
-    if (maxVotes <= 0) {
-      return null;
-    }
-
-    // Second pass to find all nominees who achieved the maximum score
-    for (const nomineeName in votesForCurrentSuperlative) {
-      if (votesForCurrentSuperlative[nomineeName] === maxVotes) {
-        winners.push(nomineeName);
+      if (b.graduatingVotes !== a.graduatingVotes) {
+        return b.graduatingVotes - a.graduatingVotes;
       }
-    }
+      // Handle null timestamps (e.g., if a vote somehow didn't get one)
+      if (!a.firstVoteTimestamp && !b.firstVoteTimestamp) return 0;
+      if (!a.firstVoteTimestamp) return 1; // b comes first if a has no timestamp
+      if (!b.firstVoteTimestamp) return -1; // a comes first if b has no timestamp
+      return new Date(a.firstVoteTimestamp).getTime() - new Date(b.firstVoteTimestamp).getTime();
+    });
     
-    // Should not happen if maxVotes > 0, but as a safeguard:
-    if (winners.length === 0) {
-        return null; 
-    }
+    if (nomineeDataForSorting.length === 0) return null; // Should be caught by filter earlier, but safeguard
 
-    const winnerObjects = winners.map(name => {
-      const nomineeObj = currentSuperlative.nominees.find(n => n.name === name);
-      return nomineeObj ? { ...nomineeObj, count: maxVotes, isTie: winners.length > 1 } : null;
-    }).filter(Boolean); 
+    const topNominee = nomineeDataForSorting[0];
+    
+    // Find all nominees who are tied with the top nominee based on all criteria
+    const tiedWinners = nomineeDataForSorting.filter(n => 
+        n.score === topNominee.score &&
+        n.graduatingVotes === topNominee.graduatingVotes &&
+        ( (n.firstVoteTimestamp === null && topNominee.firstVoteTimestamp === null) ||
+          (n.firstVoteTimestamp && topNominee.firstVoteTimestamp && new Date(n.firstVoteTimestamp).getTime() === new Date(topNominee.firstVoteTimestamp).getTime()) )
+    );
+
+    const winnerObjects = tiedWinners.map(winner => {
+      const nomineeObj = currentSuperlative.nominees.find(n => n.name === winner.name);
+      return nomineeObj ? { 
+        ...nomineeObj, 
+        count: winner.score, // The 'count' is their total score
+        isTie: tiedWinners.length > 1 
+      } : null;
+    }).filter(Boolean);
       
     return winnerObjects.length > 0 ? winnerObjects : null;
 
-  }, [votesForCurrentSuperlative, currentSuperlative]);
+  }, [nomineeVoteStats, currentSuperlative]);
 
 
   const handleRevealWinner = async () => {
@@ -485,6 +539,8 @@ export default function App() {
   }, [allSuperlativesCompleted, superlativesList.length]); // Rerun if completion state changes or initial list length changes
 
   // --- Render Logic ---
+  console.log("[DEBUG App.jsx] Render. userType:", userType);
+
   if (isLoadingSuperlatives || isLoadingAppState) {
     // console.log('[DEBUG] App State: isLoadingSuperlatives:', isLoadingSuperlatives, 'isLoadingAppState:', isLoadingAppState);
     return <div className="text-xl text-center mt-10">Loading Application...</div>;
@@ -502,261 +558,331 @@ export default function App() {
 
   // User is logged in. Now determine view based on userType and isSessionStarted.
   return (
-    <div className="max-w-xl mx-auto p-4 relative pb-20">
-      {userType === 'admin' && !isSessionStarted && (
-        // Admin Start Page (Session Not Started)
-        <div className="max-w-lg mx-auto p-6 text-center">
-          <div className="flex justify-between items-center mb-6">
-            <span className="text-sm text-gray-600">Admin: {userId.substring(0,8)}</span>
-            <button onClick={handleLogout} className="text-sm text-blue-500 hover:underline">Logout</button>
-          </div>
-          <h1 className="text-3xl font-bold text-indigo-600 mb-4">Admin Dashboard</h1>
-          <p className="text-gray-700 mb-6">Session has not started. Share the QR code or link below for users to join the login page. Click "Start Voting Session" when ready.</p>
-          <div className="flex justify-center mb-6">
-            <img 
-              src={`https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qrCodeTargetUrl)}&size=250x250&format=png`} 
-              alt={`QR Code for ${qrCodeTargetUrl}`} 
-              className="border-4 border-gray-300 rounded shadow-lg"
-            />
-          </div>
-          <p className="text-gray-800 font-medium mb-1">Login Page URL:</p>
-          <a href={qrCodeTargetUrl} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline break-all">{qrCodeTargetUrl}</a>
-          
-          <div className="mt-8 pt-6 border-t border-gray-300">
-            <h2 className="text-xl font-semibold text-gray-700 mb-3">Admin Controls</h2>
-            <div className="mb-4">
-              <label htmlFor="qrUrlInput" className="block text-sm font-medium text-gray-700 mb-1">Set Login Page Target URL (Advanced):</label>
-              <input 
-                type="url" 
-                id="qrUrlInput"
-                value={adminQrUrlInput}
-                onChange={(e) => setAdminQrUrlInput(e.target.value)}
-                placeholder="Usually this app's URL"
-                className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+    <>
+      <style>
+        {`
+          @keyframes inYourFaceAnimation {
+            0% { transform: scale(0.3); opacity: 0; }
+            50% { transform: scale(1.8); opacity: 1; }
+            70% { transform: scale(0.9); }
+            100% { transform: scale(1); opacity: 1; }
+          }
+          .animate-in-your-face {
+            animation-name: inYourFaceAnimation;
+            animation-duration: 1s;
+            animation-timing-function: cubic-bezier(0.34, 1.56, 0.64, 1);
+          }
+        `}
+      </style>
+      <div className="max-w-xl mx-auto p-4 relative pb-20">
+        {userType === 'admin' && !isSessionStarted && (
+          // Admin Start Page (Session Not Started)
+          <div className="max-w-lg mx-auto p-6 text-center">
+            <div className="flex justify-between items-center mb-6">
+              <span className="text-sm text-gray-600">Admin: {userId.substring(0,8)}</span>
+              <div>
+                <button 
+                  onClick={handleFullReset} 
+                  title="Full Application Reset"
+                  className="p-2 rounded hover:bg-gray-200 text-gray-600 hover:text-red-500 transition-colors duration-150 mr-2"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6">
+                    <path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l.908-.907a.75.75 0 01.9902.055l.75.75a.75.75 0 01-.055.99l-1.5 1.5a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 01.055-.99l.908-.907A6.002 6.002 0 005.005 10.5a6 6 0 005.793 5.995V19.5a.75.75 0 01-.75.75H8.25a.75.75 0 01-.75-.75v-2.278A7.501 7.501 0 014.755 10.059zM19.245 13.941a7.5 7.5 0 01-12.548 3.364l-.908.907a.75.75 0 01-.9902-.055l-.75-.75a.75.75 0 01.055-.99l1.5-1.5a.75.75 0 011.06 0l1.5 1.5a.75.75 0 01-.055.99l-.908.907A6.002 6.002 0 0018.995 13.5a6 6 0 00-5.793-5.995V4.5a.75.75 0 01.75-.75h2.25a.75.75 0 01.75.75v2.278a7.501 7.501 0 01-4.755 6.662z" clipRule="evenodd" />
+                  </svg>
+                </button>
+                <button onClick={handleLogout} className="text-sm text-blue-500 hover:underline">Logout</button>
+              </div>
+            </div>
+            <h1 className="text-3xl font-bold text-indigo-600 mb-4">Admin Dashboard</h1>
+            <p className="text-gray-700 mb-6">Session has not started. Share the QR code or link below for users to join the login page. Click "Start Voting Session" when ready.</p>
+            <div className="flex justify-center mb-6">
+              <img 
+                src={`https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qrCodeTargetUrl)}&size=250x250&format=png`} 
+                alt={`QR Code for ${qrCodeTargetUrl}`} 
+                className="border-4 border-gray-300 rounded shadow-lg"
               />
+            </div>
+            <p className="text-gray-800 font-medium mb-1">Login Page URL:</p>
+            <a href={qrCodeTargetUrl} target="_blank" rel="noopener noreferrer" className="text-blue-500 hover:underline break-all">{qrCodeTargetUrl}</a>
+            
+            <div className="mt-8 pt-6 border-t border-gray-300">
+              <h2 className="text-xl font-semibold text-gray-700 mb-3">Admin Controls</h2>
+              <div className="mb-4">
+                <label htmlFor="qrUrlInput" className="block text-sm font-medium text-gray-700 mb-1">Set Login Page Target URL (Advanced):</label>
+                <input 
+                  type="url" 
+                  id="qrUrlInput"
+                  value={adminQrUrlInput}
+                  onChange={(e) => setAdminQrUrlInput(e.target.value)}
+                  placeholder="Usually this app's URL"
+                  className="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-indigo-500 focus:border-indigo-500 sm:text-sm"
+                />
+                <button 
+                  onClick={handleUpdateQrUrl}
+                  className="mt-2 bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600 transition duration-150 disabled:opacity-50"
+                  disabled={adminQrUrlInput.trim() === '' || adminQrUrlInput === qrCodeTargetUrl}
+                >
+                  Save URL
+                </button>
+              </div>
               <button 
-                onClick={handleUpdateQrUrl}
-                className="mt-2 bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600 transition duration-150 disabled:opacity-50"
-                disabled={adminQrUrlInput.trim() === '' || adminQrUrlInput === qrCodeTargetUrl}
+                onClick={handleStartVotingSession}
+                className="bg-green-600 text-white py-3 px-6 rounded-lg text-lg font-semibold hover:bg-green-700 transition duration-150 shadow-md mb-4"
               >
-                Save URL
+                Start Voting Session
               </button>
             </div>
-            <button 
-              onClick={handleStartVotingSession}
-              className="bg-green-600 text-white py-3 px-6 rounded-lg text-lg font-semibold hover:bg-green-700 transition duration-150 shadow-md mb-4"
-            >
-              Start Voting Session
-            </button>
-            <button 
-              onClick={handleFullReset} 
-              className="bg-red-600 text-white py-2 px-4 rounded hover:bg-red-700 transition duration-150 w-full sm:w-auto"
-            >
-              ⚠️ Reset All & Start Over ⚠️
-            </button>
           </div>
-        </div>
-      )}
+        )}
 
-      {userType !== 'admin' && !isSessionStarted && (
-        // Non-Admin Waiting Page (Session Not Started)
-        <div className="max-w-lg mx-auto p-6 text-center">
-           <div className="flex justify-between items-center mb-6">
-            <span className="text-sm text-gray-600">User: {userType} ({userId.substring(0,8)})</span>
-            <button onClick={handleLogout} className="text-sm text-blue-500 hover:underline">Logout</button>
+        {userType !== 'admin' && !isSessionStarted && (
+          // Non-Admin Waiting Page (Session Not Started)
+          <div className="max-w-lg mx-auto p-6 text-center">
+             <div className="flex justify-between items-center mb-6">
+              <span className="text-sm text-gray-600">User: {userType} ({userId.substring(0,8)})</span>
+              <button onClick={handleLogout} className="text-sm text-blue-500 hover:underline">Logout</button>
+            </div>
+            <h1 className="text-2xl font-bold text-indigo-600 mb-4">Welcome, {userId.substring(0,8)}!</h1>
+            <p className="text-gray-700 text-lg">You have successfully logged in.</p>
+            <p className="text-gray-600 mt-2">Please wait for the admin to start the voting session.</p>
+            <div className="mt-8">
+               <svg className="animate-spin h-10 w-10 text-indigo-500 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+            </div>
           </div>
-          <h1 className="text-2xl font-bold text-indigo-600 mb-4">Welcome, {userId.substring(0,8)}!</h1>
-          <p className="text-gray-700 text-lg">You have successfully logged in.</p>
-          <p className="text-gray-600 mt-2">Please wait for the admin to start the voting session.</p>
-          <div className="mt-8">
-             <svg className="animate-spin h-10 w-10 text-indigo-500 mx-auto" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-              </svg>
-          </div>
-        </div>
-      )}
+        )}
 
-      {isSessionStarted && (
-        // Main Application View (Session Started for Admin or Non-Admin)
-        <>
-          {allSuperlativesCompleted ? (
-            // Final Summary View
-            isLoadingFinalSummary ? (
-              <div className="text-xl text-center mt-10">Generating Final Results Summary...</div>
-            ) : !finalSummaryData || Object.keys(finalSummaryData).length === 0 ? (
-              <div className="text-xl text-center mt-10">No winners to summarize, or still processing. Thanks for participating!</div>
-            ) : (
-              <div className="max-w-2xl mx-auto p-4">
-                <h1 className="text-3xl font-bold text-center mb-6 text-indigo-600">🏆 Final Results Summary 🏆</h1>
-                <div className="space-y-6">
-                  {Object.entries(finalSummaryData).map(([winnerName, data]) => (
-                    <div key={winnerName} className="bg-white shadow-lg rounded-lg p-4 flex items-start space-x-4">
-                      <img 
-                        src={data.image} 
-                        alt={winnerName} 
-                        className="w-20 h-20 rounded-full object-cover border-2 border-indigo-300" 
-                        onError={(e) => e.target.src = '/images/default-avatar.png'} 
-                      />
-                      <div className="flex-1">
-                        <h2 className="text-2xl font-semibold text-indigo-700">{winnerName}</h2>
-                        <p className="text-md text-gray-600 mb-1">Won the following superlatives:</p>
-                        <ul className="list-disc list-inside pl-2 space-y-1">
-                          {data.superlativesWon.map(s => (
-                            <li key={s.id} className="text-gray-700">{s.title}</li>
-                          ))}
-                        </ul>
+        {isSessionStarted && (
+          // Main Application View (Session Started for Admin or Non-Admin)
+          <>
+            {allSuperlativesCompleted ? (
+              // Final Summary View
+              isLoadingFinalSummary ? (
+                <div className="text-xl text-center mt-10">Generating Final Results Summary...</div>
+              ) : !finalSummaryData || Object.keys(finalSummaryData).length === 0 ? (
+                <div className="text-xl text-center mt-10">No winners to summarize, or still processing. Thanks for participating!</div>
+              ) : (
+                <div className="max-w-2xl mx-auto p-4">
+                  <h1 className="text-3xl font-bold text-center mb-6 text-indigo-600">🏆 Final Results Summary 🏆</h1>
+                  <div className="space-y-6">
+                    {Object.entries(finalSummaryData).map(([winnerName, data]) => (
+                      <div key={winnerName} className="bg-white shadow-lg rounded-lg p-4 flex items-start space-x-4">
+                        <img 
+                          src={data.image || '/images/default-avatar.png'} 
+                          alt={winnerName} 
+                          className="w-20 h-20 rounded-full object-cover border-2 border-indigo-300" 
+                          onError={(e) => { e.target.style.display = 'none'; }}
+                        />
+                        <div className="flex-1">
+                          <h2 className="text-2xl font-semibold text-indigo-700">{winnerName}</h2>
+                          <p className="text-md text-gray-600 mb-1">Won the following superlatives:</p>
+                          <ul className="list-disc list-inside pl-2 space-y-1">
+                            {data.superlativesWon.map(s => (
+                              <li key={s.id} className="text-gray-700">{s.title}</li>
+                            ))}
+                          </ul>
+                        </div>
                       </div>
-                    </div>
-                  ))}
-                </div>
-                {userType === 'admin' && (
-                  <div className="text-center mt-8 flex flex-col items-center gap-4">
-                    <button 
-                      onClick={handlePreviousQuestion} 
-                      className="bg-gray-500 text-white py-2 px-4 rounded hover:bg-gray-600 transition duration-150 w-full sm:w-auto"
-                    >
-                      Back to Last Question
-                    </button>
-                    <button 
-                      onClick={handleFullReset} 
-                      className="bg-red-600 text-white py-2 px-4 rounded hover:bg-red-700 transition duration-150 w-full sm:w-auto"
-                    >
-                      ⚠️ Reset All & Start Over ⚠️
-                    </button>
-                  </div>
-                )}
-              </div>
-            )
-          ) : superlativesList.length === 0 && !isLoadingSuperlatives ? (
-            <div className="text-xl text-center mt-10">
-              No superlatives have been set up for this session. Please contact the admin.
-            </div>
-          ) : currentQuestionIndex >= superlativesList.length && superlativesList.length > 0 && !isLoadingSuperlatives ? (
-            <div className="text-xl text-center mt-10">
-              Thanks for participating! All superlatives completed. (Waiting for admin to show final summary)
-            </div>
-          ) : currentSuperlative && typeof currentSuperlative.title === 'string' && Array.isArray(currentSuperlative.nominees) ? (
-            <>
-              {(() => { 
-                // console.log('[DEBUG] Rendering: Main Question/Voting View. Superlative:', currentSuperlative);
-                return null; 
-              })()}
-              <div className="current-superlative-view">
-                {(() => {
-                  const winnerDetails = getWinner();
-                  if (isResultShown && winnerDetails && winnerDetails.length > 0) {
-                    const isActuallyTie = winnerDetails[0].isTie;
-
-                    // Default confetti settings
-                    let resolvedConfettiProps = {
-                      recycle: false,
-                      numberOfPieces: isActuallyTie ? 200 : 400,
-                      width: dimensions.width,
-                      height: dimensions.height,
-                      // You can add more react-confetti default props here
-                    };
-
-                    if (currentSuperlative?.resultAnimation) {
-                      const customAnim = currentSuperlative.resultAnimation;
-                      resolvedConfettiProps.recycle = customAnim.recycle ?? resolvedConfettiProps.recycle;
-
-                      if (isActuallyTie) {
-                        // For a tie, use tieNumberOfPieces if available, then numberOfPieces (general), then default tie pieces
-                        resolvedConfettiProps.numberOfPieces = customAnim.tieNumberOfPieces ?? customAnim.numberOfPieces ?? resolvedConfettiProps.numberOfPieces;
-                      } else { // Single winner
-                        // For a single winner, use numberOfPieces if available, then default single winner pieces
-                        resolvedConfettiProps.numberOfPieces = customAnim.numberOfPieces ?? resolvedConfettiProps.numberOfPieces;
-                      }
-                      
-                      // Example for future extension: Allow overriding other confetti props
-                      // if (customAnim.colors) resolvedConfettiProps.colors = customAnim.colors;
-                      // if (customAnim.gravity) resolvedConfettiProps.gravity = customAnim.gravity;
-                    }
-                    return <Confetti {...resolvedConfettiProps} />;
-                  }
-                  return null;
-                })()}
-                <div className="flex justify-between items-center mb-2">
-                  <span className="text-sm text-gray-600">User: {userType} ({userId.substring(0,8)})</span>
-                  <button onClick={handleLogout} className="text-sm text-blue-500 hover:underline">Logout</button>
-                </div>
-                <h1 className="text-2xl font-bold text-center mb-4">{currentSuperlative.title}</h1>
-                {!isResultShown ? (
-                  // Voting Phase
-                  <div className="grid gap-4">
-                    {currentSuperlative.nominees.map((n) => (
-                      <label
-                        key={n.name}
-                        className={`flex items-center gap-4 border p-4 rounded hover:shadow ${isResultShown ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'} ${localSelectedNominee === n.name ? 'ring-2 ring-blue-500 border-blue-500' : 'border-gray-300'}`}
-                      >
-                        <input type="radio" name={currentSuperlative.id} value={n.name} checked={localSelectedNominee === n.name} onChange={() => handleVote(n.name)} disabled={isResultShown || isVoting || !isSessionStarted} className="form-radio h-5 w-5 text-blue-600"/>
-                        <img src={n.image} alt={n.name} className="w-16 h-16 rounded-full object-cover" />
-                        <span className="text-lg font-medium">{n.name}</span>
-                      </label>
                     ))}
-                    {userType === 'admin' && !isResultShown && !allSuperlativesCompleted && (
-                      <div className="mt-4 p-3 border rounded bg-gray-50">
-                        <h3 className="text-md font-semibold text-gray-700 mb-1">Live Vote Status (Admin View):</h3>
-                        {currentSuperlative.nominees.length > 0 ? (<div className="text-sm text-gray-600">Total Votes Cast: {Object.values(votesForCurrentSuperlative).reduce((sum, count) => sum + count, 0)}</div>) : <p className="text-sm text-gray-500">No nominees for this superlative.</p>}
-                      </div>
-                    )}
-                    {userType === 'admin' && !isResultShown && !allSuperlativesCompleted && (
-                       <div className="mt-6 flex flex-col sm:flex-row justify-center gap-2 items-center">
-                          <button onClick={handleRevealWinner} disabled={Object.values(votesForCurrentSuperlative).every(v => v === 0) && !localSelectedNominee} className="bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600 disabled:opacity-50">Reveal Winner</button>
-                          {currentQuestionIndex < superlativesList.length - 1 && (<button onClick={nextQuestion} className="bg-green-500 text-white py-2 px-4 rounded hover:bg-green-600">Next Superlative</button>)}
-                       </div>
-                    )}
-                    {userType !== 'admin' && !allSuperlativesCompleted && (<p className="text-center text-gray-600 mt-4">{localSelectedNominee ? "Your vote has been cast. Waiting for Admin to reveal winner." : "Please cast your vote."}</p>)}
                   </div>
-                ) : (
-                  // Results Phase
-                  getWinner() && getWinner().length > 0 && ( // Ensure getWinner() is called and returns valid data
-                    <div className="text-center">
-                      <h2 className="text-xl font-semibold mb-4">🏆 {getWinner()[0].isTie ? "It's a Tie!" : `Winner: ${getWinner()[0].name}`} 🏆</h2>
-                      <div className={`flex ${getWinner().length > 1 ? 'justify-around' : 'justify-center'} items-start flex-wrap`}>
-                        {getWinner().map((w, index) => (
-                          <div key={index} className="text-center m-2 flex flex-col items-center">
-                            {w.image && (<img src={w.image} alt={w.name} className="w-40 h-40 rounded-full mb-2 object-cover shadow-lg border-4 border-yellow-400"/>)}
-                            {(getWinner()[0].isTie || getWinner().length > 1) && (<div className="text-lg font-medium mt-1">{w.name}</div>)}
-                            <div className="text-md font-semibold">{w.count} vote(s)</div>
-                          </div>
-                        ))}
-                      </div>
-                      <div className="mt-6 mb-6">
-                        <h3 className="text-lg font-semibold text-gray-700 mb-2">Final Vote Tally:</h3>
-                        <ul className="list-none p-0 space-y-1">
-                          {currentSuperlative.nominees.map(nominee => (<li key={nominee.name} className="text-gray-600">{nominee.name}: <span className="font-semibold">{votesForCurrentSuperlative[nominee.name] || 0} vote(s)</span></li>))}
-                        </ul>
-                      </div>
-                      {userType === 'admin' && isResultShown && !allSuperlativesCompleted && (
-                        <div className="mt-6 flex flex-col sm:flex-row justify-center gap-2 items-center flex-wrap">
-                          {currentQuestionIndex > 0 && (<button onClick={handlePreviousQuestion} className="bg-gray-500 text-white py-2 px-4 rounded hover:bg-gray-600 transition duration-150">Previous Question</button>)}
-                          <button onClick={handleResetCurrentResults} className="bg-yellow-500 text-white py-2 px-4 rounded hover:bg-yellow-600 transition duration-150">Hide Results & Re-open Voting</button>
-                          {currentQuestionIndex < superlativesList.length - 1 && (<button onClick={nextQuestion} className="bg-green-500 text-white py-2 px-4 rounded hover:bg-green-600 transition duration-150">Next Superlative</button>)}
-                          {currentQuestionIndex === superlativesList.length - 1 && (<button onClick={proceedToFinalSummary} className="bg-purple-500 text-white py-2 px-4 rounded hover:bg-purple-600 transition duration-150">Show Final Summary</button>)}
-                          {currentQuestionIndex === 0 && isResultShown && (<button onClick={handleFullReset} className="bg-red-600 text-white py-2 px-4 rounded hover:bg-red-700 transition duration-150 mt-2 sm:mt-0">⚠️ Reset All & Start Over ⚠️</button>)}
+                  {userType === 'admin' && (
+                    <div className="text-center mt-8 flex flex-col items-center gap-4">
+                      <button 
+                        onClick={handlePreviousQuestion} 
+                        className="bg-gray-500 text-white py-2 px-4 rounded hover:bg-gray-600 transition duration-150 w-full sm:w-auto"
+                      >
+                        Back to Last Question
+                      </button>
+                      <button 
+                        onClick={handleFullReset} 
+                        title="Full Application Reset"
+                        className="p-2 rounded hover:bg-gray-200 text-gray-600 hover:text-red-500 transition-colors duration-150 text-2xl mt-2 sm:mt-0 self-center"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6">
+                          <path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l.908-.907a.75.75 0 01.9902.055l.75.75a.75.75 0 01-.055.99l-1.5 1.5a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 01.055-.99l.908-.907A6.002 6.002 0 005.005 10.5a6 6 0 005.793 5.995V19.5a.75.75 0 01-.75.75H8.25a.75.75 0 01-.75-.75v-2.278A7.501 7.501 0 014.755 10.059zM19.245 13.941a7.5 7.5 0 01-12.548 3.364l-.908.907a.75.75 0 01-.9902-.055l-.75-.75a.75.75 0 01.055-.99l1.5-1.5a.75.75 0 011.06 0l1.5 1.5a.75.75 0 01-.055.99l-.908.907A6.002 6.002 0 0018.995 13.5a6 6 0 00-5.793-5.995V4.5a.75.75 0 01.75-.75h2.25a.75.75 0 01.75.75v2.278a7.501 7.501 0 01-4.755 6.662z" clipRule="evenodd" />
+                        </svg>
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )
+            ) : superlativesList.length === 0 && !isLoadingSuperlatives ? (
+              <div className="text-xl text-center mt-10">
+                No superlatives have been set up for this session. Please contact the admin.
+              </div>
+            ) : currentQuestionIndex >= superlativesList.length && superlativesList.length > 0 && !isLoadingSuperlatives ? (
+              <div className="text-xl text-center mt-10">
+                Thanks for participating! All superlatives completed. (Waiting for admin to show final summary)
+              </div>
+            ) : currentSuperlative && typeof currentSuperlative.title === 'string' && Array.isArray(currentSuperlative.nominees) ? (
+              <>
+                {(() => { 
+                  // console.log('[DEBUG] Rendering: Main Question/Voting View. Superlative:', currentSuperlative);
+                  return null; 
+                })()}
+                <div className="current-superlative-view">
+                  {(() => {
+                    const winnerDetails = getWinner();
+                    if (isResultShown && winnerDetails && winnerDetails.length > 0) {
+                      const isActuallyTie = winnerDetails[0].isTie;
+
+                      // Default confetti settings
+                      let resolvedConfettiProps = {
+                        recycle: false,
+                        numberOfPieces: isActuallyTie ? 200 : 400,
+                        width: dimensions.width,
+                        height: dimensions.height,
+                        // You can add more react-confetti default props here
+                      };
+
+                      if (currentSuperlative?.resultAnimation) {
+                        const customAnim = currentSuperlative.resultAnimation;
+                        resolvedConfettiProps.recycle = customAnim.recycle ?? resolvedConfettiProps.recycle;
+
+                        if (isActuallyTie) {
+                          // For a tie, use tieNumberOfPieces if available, then numberOfPieces (general), then default tie pieces
+                          resolvedConfettiProps.numberOfPieces = customAnim.tieNumberOfPieces ?? customAnim.numberOfPieces ?? resolvedConfettiProps.numberOfPieces;
+                        } else { // Single winner
+                          // For a single winner, use numberOfPieces if available, then default single winner pieces
+                          resolvedConfettiProps.numberOfPieces = customAnim.numberOfPieces ?? resolvedConfettiProps.numberOfPieces;
+                        }
+                        
+                        // Example for future extension: Allow overriding other confetti props
+                        // if (customAnim.colors) resolvedConfettiProps.colors = customAnim.colors;
+                        // if (customAnim.gravity) resolvedConfettiProps.gravity = customAnim.gravity;
+                      }
+                      return <Confetti {...resolvedConfettiProps} />;
+                    }
+                    return null;
+                  })()}
+                  <div className="flex justify-between items-center mb-2">
+                    <span className="text-sm text-gray-600">User: {userType} ({userId.substring(0,8)})</span>
+                    <button onClick={handleLogout} className="text-sm text-blue-500 hover:underline">Logout</button>
+                  </div>
+                  <h1 className="text-2xl font-bold text-center mb-4">{currentSuperlative.title}</h1>
+                  {!isResultShown ? (
+                    // Voting Phase
+                    <div className="grid gap-4">
+                      {shuffledNominees.map((n) => (
+                        <label
+                          key={n.name}
+                          className={`flex items-center gap-4 border p-4 rounded hover:shadow ${isResultShown ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'} ${localSelectedNominee === n.name ? 'ring-2 ring-blue-500 border-blue-500' : 'border-gray-300'}`}
+                        >
+                          <input type="radio" name={currentSuperlative.id} value={n.name} checked={localSelectedNominee === n.name} onChange={() => handleVote(n.name)} disabled={isResultShown || isVoting || !isSessionStarted} className="form-radio h-5 w-5 text-blue-600"/>
+                          <img 
+                            src={n.image || '/images/default-avatar.png'} 
+                            alt={n.name} 
+                            className="w-16 h-16 rounded-full object-cover" 
+                            onError={(e) => { e.target.style.display = 'none'; }}
+                          />
+                          <span className="text-lg font-medium">{n.name}</span>
+                        </label>
+                      ))}
+                      {userType === 'admin' && !isResultShown && !allSuperlativesCompleted && (
+                        <div className="mt-4 p-3 border rounded bg-gray-50">
+                          <h3 className="text-md font-semibold text-gray-700 mb-1">Live Vote Status (Admin View):</h3>
+                          {shuffledNominees.length > 0 ? (
+                            <div className="text-sm text-gray-600">
+                              Total Votes Cast: {totalRawVotesCount} 
+                            </div>
+                          ) : <p className="text-sm text-gray-500">No nominees for this superlative.</p>}
                         </div>
                       )}
-                      {userType !== 'admin' && !allSuperlativesCompleted && currentQuestionIndex < superlativesList.length -1 && (<p className="text-center text-gray-600 mt-6">Waiting for Admin to proceed to the next superlative.</p>)}
-                      {userType !== 'admin' && !allSuperlativesCompleted && currentQuestionIndex >= superlativesList.length -1 && (<p className="text-center text-gray-600 mt-6 font-semibold">All superlatives completed! Waiting for admin to show final summary.</p>)}
+                      {userType === 'admin' && !isResultShown && !allSuperlativesCompleted && (
+                        <div className="mt-6 flex flex-col sm:flex-row justify-center gap-2 items-center flex-wrap">
+                          {currentQuestionIndex > 0 && (
+                            <button 
+                              onClick={handlePreviousQuestion} 
+                              className="bg-gray-500 text-white py-2 px-4 rounded hover:bg-gray-600 transition duration-150"
+                            >
+                              Previous Superlative
+                            </button>
+                          )}
+                          <button
+                            onClick={handleRevealWinner}
+                            disabled={Object.values(nomineeVoteStats).every(stats => stats.score === 0) && !localSelectedNominee} 
+                            className="bg-blue-500 text-white py-2 px-4 rounded hover:bg-blue-600 disabled:opacity-50 transition duration-150"
+                          >
+                            Reveal Winner
+                          </button>
+                          {currentQuestionIndex < superlativesList.length - 1 && (
+                            <button 
+                              onClick={nextQuestion} 
+                              className="bg-green-500 text-white py-2 px-4 rounded hover:bg-green-600 transition duration-150"
+                            >
+                              Next Superlative
+                            </button>
+                          )}
+                        </div>
+                      )}
+                      {userType !== 'admin' && !allSuperlativesCompleted && (<p className="text-center text-gray-600 mt-4">{localSelectedNominee ? "Your vote has been cast. Waiting for Admin to reveal winner." : "Please cast your vote."}</p>)}
                     </div>
-                  )
-                )}
-              </div>
-            </>
-          ) : (
-            <>
-              {(() => { 
-                // console.log('[DEBUG] Fallback: currentSuperlative is falsey or invalid. superlativesList:', superlativesList, 'currentQuestionIndex:', currentQuestionIndex, 'isLoadingSuperlatives:', isLoadingSuperlatives);
-                return null; 
-              })()}
-              <div className="text-xl text-center mt-10">
-                Loading question, waiting for session to be fully initialized, or current question data is invalid.
-              </div>
-            </>
-          )
-        }
+                  ) : (
+                    // Results Phase
+                    getWinner() && getWinner().length > 0 && (
+                      <div className="text-center">
+                        <h2 className="text-xl font-semibold mb-4">🏆 {getWinner()[0].isTie ? "It's a Tie!" : `Winner: ${getWinner()[0].name}`} 🏆</h2>
+                        <div className={`flex ${getWinner().length > 1 ? 'justify-around' : 'justify-center'} items-start flex-wrap`}>
+                          {getWinner().map((w, index) => (
+                            <div key={index} className="text-center m-2 flex flex-col items-center">
+                              <img 
+                                src={w.image || '/images/default-avatar.png'} 
+                                alt={w.name} 
+                                className={`w-40 h-40 rounded-full mb-2 object-cover shadow-lg border-4 border-yellow-400 ${isResultShown ? 'animate-in-your-face' : ''}`} 
+                                onError={(e) => { e.target.style.display = 'none'; }}
+                              />
+                              {(getWinner()[0].isTie || getWinner().length > 1) && (<div className="text-lg font-medium mt-1">{w.name}</div>)}
+                              <div className="text-md font-semibold">{w.count} vote(s)</div>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="mt-6 mb-6">
+                          <h3 className="text-lg font-semibold text-gray-700 mb-2">Final Vote Tally:</h3>
+                          <ul className="list-none p-0 space-y-1">
+                            {shuffledNominees.map(nominee => (<li key={nominee.name} className="text-gray-600">{nominee.name}: <span className="font-semibold">{nomineeVoteStats[nominee.name]?.score || 0} vote(s)</span></li>))}
+                          </ul>
+                        </div>
+                        {userType === 'admin' && isResultShown && !allSuperlativesCompleted && (
+                          <div className="mt-6 flex flex-col sm:flex-row justify-center gap-2 items-center flex-wrap">
+                            {currentQuestionIndex > 0 && (<button onClick={handlePreviousQuestion} className="bg-gray-500 text-white py-2 px-4 rounded hover:bg-gray-600 transition duration-150">Previous Question</button>)}
+                            <button onClick={handleResetCurrentResults} className="bg-yellow-500 text-white py-2 px-4 rounded hover:bg-yellow-600 transition duration-150">Hide Results & Re-open Voting</button>
+                            {currentQuestionIndex < superlativesList.length - 1 && (<button onClick={nextQuestion} className="bg-green-500 text-white py-2 px-4 rounded hover:bg-green-600 transition duration-150">Next Superlative</button>)}
+                            {currentQuestionIndex === superlativesList.length - 1 && (<button onClick={proceedToFinalSummary} className="bg-purple-500 text-white py-2 px-4 rounded hover:bg-purple-600 transition duration-150">Show Final Summary</button>)}
+                            {currentQuestionIndex === 0 && isResultShown && (
+                              <button 
+                                onClick={handleFullReset} 
+                                title="Full Application Reset"
+                                className="p-2 rounded hover:bg-gray-200 text-gray-600 hover:text-red-500 transition-colors duration-150 ml-2"
+                              >
+                                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6">
+                                  <path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l.908-.907a.75.75 0 01.9902.055l.75.75a.75.75 0 01-.055.99l-1.5 1.5a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 01.055-.99l.908-.907A6.002 6.002 0 005.005 10.5a6 6 0 005.793 5.995V19.5a.75.75 0 01-.75.75H8.25a.75.75 0 01-.75-.75v-2.278A7.501 7.501 0 014.755 10.059zM19.245 13.941a7.5 7.5 0 01-12.548 3.364l-.908.907a.75.75 0 01-.9902-.055l-.75-.75a.75.75 0 01.055-.99l1.5-1.5a.75.75 0 011.06 0l1.5 1.5a.75.75 0 01-.055.99l-.908.907A6.002 6.002 0 0018.995 13.5a6 6 0 00-5.793-5.995V4.5a.75.75 0 01.75-.75h2.25a.75.75 0 01.75.75v2.278a7.501 7.501 0 01-4.755 6.662z" clipRule="evenodd" />
+                                </svg>
+                              </button>
+                            )}
+                          </div>
+                        )}
+                        {userType !== 'admin' && !allSuperlativesCompleted && currentQuestionIndex < superlativesList.length -1 && (<p className="text-center text-gray-600 mt-6">Waiting for Admin to proceed to the next superlative.</p>)}
+                        {userType !== 'admin' && !allSuperlativesCompleted && currentQuestionIndex >= superlativesList.length -1 && (<p className="text-center text-gray-600 mt-6 font-semibold">All superlatives completed! Waiting for admin to show final summary.</p>)}
+                      </div>
+                    )
+                  )}
+                </div>
+              </>
+            ) : (
+              <>
+                {(() => { 
+                  // console.log('[DEBUG] Fallback: currentSuperlative is falsey or invalid. superlativesList:', superlativesList, 'currentQuestionIndex:', currentQuestionIndex, 'isLoadingSuperlatives:', isLoadingSuperlatives);
+                  return null; 
+                })()}
+                <div className="text-xl text-center mt-10">
+                  Loading question, waiting for session to be fully initialized, or current question data is invalid.
+                </div>
+              </>
+            )}
+          </>
+        )}
 
         {/* Persistent Pinned Admin Tools - Shown only if session started and not in final summary */}
         {userType === 'admin' && isSessionStarted && !allSuperlativesCompleted && (
@@ -764,22 +890,29 @@ export default function App() {
             <div className="text-center self-start">
               <p className="text-xs mb-1">QR to Join/View:</p>
               <img 
-                  src={`https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qrCodeTargetUrl)}&size=80x80&format=png&bgcolor=4A5568&color=FFFFFF&qzone=1`}
-                  alt="QR Code" 
-                  className="w-20 h-20 rounded border-2 border-gray-500"
+                src={`https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(qrCodeTargetUrl)}&size=80x80&format=png&bgcolor=4A5568&color=FFFFFF&qzone=1`}
+                alt="QR Code" 
+                className="w-20 h-20 rounded border-2 border-gray-500"
               />
             </div>
+          </div>
+        )}
+
+        {/* Persistent Global Admin Reset Button - Visible on all admin pages post-login */} 
+        {userType === 'admin' && userId && (
+          <div className="fixed top-4 right-4 z-[100]"> 
             <button 
               onClick={handleFullReset} 
-              className="bg-red-700 hover:bg-red-800 text-white text-xs py-1 px-2 rounded w-full transition-colors duration-150"
-              title="Reset All & Start Over"
+              title="Full Application Reset"
+              className="p-3 bg-red-600 hover:bg-red-700 text-white rounded-full shadow-lg flex items-center justify-center"
             >
-              ⚠️ Start Over
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" className="w-6 h-6">
+                <path fillRule="evenodd" d="M4.755 10.059a7.5 7.5 0 0112.548-3.364l.908-.907a.75.75 0 01.9902.055l.75.75a.75.75 0 01-.055.99l-1.5 1.5a.75.75 0 01-1.06 0l-1.5-1.5a.75.75 0 01.055-.99l.908-.907A6.002 6.002 0 005.005 10.5a6 6 0 005.793 5.995V19.5a.75.75 0 01-.75.75H8.25a.75.75 0 01-.75-.75v-2.278A7.501 7.501 0 014.755 10.059zM19.245 13.941a7.5 7.5 0 01-12.548 3.364l-.908.907a.75.75 0 01-.9902-.055l-.75-.75a.75.75 0 01.055-.99l1.5-1.5a.75.75 0 011.06 0l1.5 1.5a.75.75 0 01-.055.99l-.908.907A6.002 6.002 0 0018.995 13.5a6 6 0 00-5.793-5.995V4.5a.75.75 0 01.75-.75h2.25a.75.75 0 01.75.75v2.278a7.501 7.501 0 01-4.755 6.662z" clipRule="evenodd" />
+              </svg>
             </button>
           </div>
         )}
-      </>
-    )}
-  </div>
+      </div>
+    </>
   );
 }
