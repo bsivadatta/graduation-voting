@@ -60,6 +60,7 @@ export default function App() {
   const [finalSummaryData, setFinalSummaryData] = useState(null);
   const [adminQrUrlInput, setAdminQrUrlInput] = useState(''); // Local input for admin to change QR URL
   const [shuffledNominees, setShuffledNominees] = useState([]);
+  const [adminGoToQuestionInput, setAdminGoToQuestionInput] = useState(''); // New state for admin direct question input
 
   // Persist userType and userId in localStorage
   useEffect(() => {
@@ -367,11 +368,16 @@ export default function App() {
     if (userType === 'admin') {
       const appStateDocRef = doc(db, GLOBAL_STATE_COLLECTION, CURRENT_STATE_DOC);
       try {
+        // Check if we are already on the last question and results are shown
+        // If so, this button effectively just confirms moving to the summary.
+        // Otherwise, it will mark all as completed and show summary.
+        const isLastQuestion = currentQuestionIndex === superlativesList.length - 1;
+        
         await updateDoc(appStateDocRef, {
-          isResultShown: true,
+          // isResultShown: true, // Results for the current/last q should be shown or decided by reveal winner
           allSuperlativesCompleted: true,
         });
-        console.log("Proceeding to final summary view.");
+        console.log("Proceeding to final summary view by admin command.");
       } catch (error) {
         console.error("Error proceeding to final summary:", error);
       }
@@ -459,6 +465,22 @@ export default function App() {
       }
     } else {
       console.log("Full reset cancelled by admin.");
+    }
+  };
+
+  const handleGoToQuestion = async (index) => {
+    if (userType === 'admin' && superlativesList.length > 0 && index >= 0 && index < superlativesList.length) {
+      const appStateDocRef = doc(db, GLOBAL_STATE_COLLECTION, CURRENT_STATE_DOC);
+      try {
+        await updateDoc(appStateDocRef, {
+          currentQuestionIndex: index,
+          isResultShown: false,
+          allSuperlativesCompleted: false, // Ensure we are not in summary view
+        });
+        console.log(`Admin navigated to question ${index + 1}`);
+      } catch (error) {
+        console.error("Error navigating to question:", error);
+      }
     }
   };
 
@@ -657,6 +679,16 @@ export default function App() {
         {isSessionStarted && (
           // Main Application View (Session Started for Admin or Non-Admin)
           <>
+            {userType === 'admin' && !allSuperlativesCompleted && superlativesList.length > 0 && (
+              // This div was previously removed, now it's an empty placeholder or can be removed if truly not needed for other controls later.
+              // For now, keeping it as a commented out placeholder for clarity of what was removed.
+              /*
+              <div className="admin-navigation-controls bg-gray-100 p-3 rounded-md shadow mb-4">
+                // Content removed as per user request (dropdown and specific summary button)
+              </div>
+              */
+              <></> // Render nothing here for now, as specific controls were moved
+            )}
             {allSuperlativesCompleted ? (
               // Final Summary View
               isLoadingFinalSummary ? (
@@ -849,7 +881,6 @@ export default function App() {
                             {currentQuestionIndex > 0 && (<button onClick={handlePreviousQuestion} className="bg-gray-500 text-white py-2 px-4 rounded hover:bg-gray-600 transition duration-150">Previous Question</button>)}
                             <button onClick={handleResetCurrentResults} className="bg-yellow-500 text-white py-2 px-4 rounded hover:bg-yellow-600 transition duration-150">Hide Results & Re-open Voting</button>
                             {currentQuestionIndex < superlativesList.length - 1 && (<button onClick={nextQuestion} className="bg-green-500 text-white py-2 px-4 rounded hover:bg-green-600 transition duration-150">Next Superlative</button>)}
-                            {currentQuestionIndex === superlativesList.length - 1 && (<button onClick={proceedToFinalSummary} className="bg-purple-500 text-white py-2 px-4 rounded hover:bg-purple-600 transition duration-150">Show Final Summary</button>)}
                             {currentQuestionIndex === 0 && isResultShown && (
                               <button 
                                 onClick={handleFullReset} 
@@ -895,6 +926,55 @@ export default function App() {
                 className="w-20 h-20 rounded border-2 border-gray-500"
               />
             </div>
+            {/* "Go to Question" Input for Admin */}
+            {superlativesList.length > 0 && (
+              <div className="w-full">
+                <label htmlFor="admin-goto-question" className="block text-xs mb-1">Go to:</label>
+                <div className="flex items-center gap-1">
+                  <input 
+                    type="number"
+                    id="admin-goto-question"
+                    value={adminGoToQuestionInput}
+                    onChange={(e) => setAdminGoToQuestionInput(e.target.value)}
+                    onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                            const questionNum = parseInt(adminGoToQuestionInput);
+                            if (!isNaN(questionNum) && questionNum >= 1 && questionNum <= superlativesList.length) {
+                                handleGoToQuestion(questionNum - 1); // Adjust to 0-indexed
+                                setAdminGoToQuestionInput(''); // Clear input after navigation
+                            }
+                        }
+                    }}
+                    min="1"
+                    max={superlativesList.length}
+                    className="w-full px-2 py-1 text-sm text-gray-900 rounded border-gray-300 focus:ring-indigo-500 focus:border-indigo-500"
+                  />
+                  <button 
+                    onClick={() => {
+                        const questionNum = parseInt(adminGoToQuestionInput);
+                        if (!isNaN(questionNum) && questionNum >= 1 && questionNum <= superlativesList.length) {
+                            handleGoToQuestion(questionNum - 1); // Adjust to 0-indexed
+                            setAdminGoToQuestionInput(''); // Clear input after navigation
+                        }
+                    }}
+                    className="bg-blue-500 hover:bg-blue-600 text-white px-3 py-1 rounded text-sm"
+                    disabled={!adminGoToQuestionInput.trim() || parseInt(adminGoToQuestionInput) < 1 || parseInt(adminGoToQuestionInput) > superlativesList.length}
+                  >
+                    Go
+                  </button>
+                </div>
+              </div>
+            )}
+             {/* Button to end session and show final summary, accessible from persistent tools */}
+            {superlativesList.length > 0 && (
+                <button 
+                    onClick={proceedToFinalSummary} 
+                    className="w-full bg-purple-600 text-white py-2 px-3 rounded hover:bg-purple-700 transition duration-150 text-sm mt-2"
+                    disabled={allSuperlativesCompleted}
+                >
+                    End & Show Final Summary
+                </button>
+            )}
           </div>
         )}
 
