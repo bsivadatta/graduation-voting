@@ -196,6 +196,39 @@ async function duplicateFirstSuperlativeMultipleTimes(numberOfDuplicates, titleS
   console.log(`Duplication of first superlative complete. Successfully duplicated: ${successCount}, Failed: ${failCount}`);
 }
 
+/**
+ * Adds or updates the resultAnimation field for a specific superlative identified by its order.
+ * @param {number} order - The order of the superlative to update.
+ * @param {object} resultAnimationData - The resultAnimation object to add.
+ */
+async function addResultAnimationToSuperlativeByOrder(order, resultAnimationData) {
+  if (typeof order !== 'number') {
+    console.error("Invalid order provided. Must be a number.");
+    return;
+  }
+  if (typeof resultAnimationData !== 'object' || resultAnimationData === null) {
+    console.error("Invalid resultAnimationData provided. Must be an object.");
+    return;
+  }
+
+  try {
+    const superlativesSnapshot = await db.collection(SUPERLATIVES_COLLECTION).where('order', '==', order).limit(1).get();
+
+    if (superlativesSnapshot.empty) {
+      console.log(`No superlative found with order: ${order}`);
+      return;
+    }
+
+    const superlativeDoc = superlativesSnapshot.docs[0];
+    await db.collection(SUPERLATIVES_COLLECTION).doc(superlativeDoc.id).update({
+      resultAnimation: resultAnimationData
+    });
+    console.log(`Successfully added/updated resultAnimation for superlative "${superlativeDoc.data().title}" (Order: ${order}, ID: ${superlativeDoc.id})`);
+  } catch (error) {
+    console.error(`Error updating superlative with order ${order}:`, error);
+  }
+}
+
 // ---- SCRIPT EXECUTION ----
 
 async function main() {
@@ -223,8 +256,8 @@ async function main() {
   
 //   --- Example 3: List all current superlatives ---
 //   console.log("\n--- Current Superlatives ---");
-  const allSuperlatives = await getAllSuperlatives();
-  allSuperlatives.forEach(s => console.log(`Order: ${s.order}, Title: ${s.title}, ID: ${s.id}`));
+//   const allSuperlatives = await getAllSuperlatives();
+//   allSuperlatives.forEach(s => console.log(`Order: ${s.order}, Title: ${s.title}, ID: ${s.id}`));
 
   // --- Example 4: Duplicate all existing superlatives ---
   // Make sure to adjust titleSuffix and orderOffset as needed.
@@ -246,13 +279,34 @@ async function main() {
 //   }
 
 //   console.log("\nScript finished.");
-  // --- Example 6: Duplicate the first superlative 15 times ---
-//   console.log("\n--- Duplicating first superlative 1 time ---");
-//   await duplicateFirstSuperlativeMultipleTimes(1, " - Version"); // Creates 15 copies with " - Version X" appended to title
+  // --- Example 6: Add/Update resultAnimation for a specific superlative by order ---
+//   const targetOrder = 0; // Replace with the order of the superlative you want to update
+//   const animationData = {
+//     recycle: true,
+//     numberOfPieces: 150,
+//     confettiShape: "dollar", // As defined in your App.jsx
+//     soundEffectUrl: "/sounds/your-money-song.mp3", // Path to your custom song
+//     colors: ["#34D399", "#10B981", "#059669", "#A7F3D0"] // Shades of green for money
+//   };
+//   // console.log(`\n--- Attempting to add result animation to superlative with order: ${targetOrder} ---`);
+//   await addResultAnimationToSuperlativeByOrder(targetOrder, animationData);
 
-  console.log("\nScript finished. All explicitly called examples are done."); // Modified log message
-  // The script will hang due to active Firestore listeners unless you explicitly exit.
-  // For simple scripts, this is often fine. For long-running services, manage this.
+  // --- Example 8: Add/Update "Flight Mode / No Signal" resultAnimation for a specific superlative by order ---
+
+
+
+  const targetOrderForFlightMode = 19; // <<<< CHANGE THIS to the order of the superlative you want to update
+  const flightModeAnimationData = {
+    // --- Settings for a more dynamic "Flying Airplanes" Effect ---
+    
+    soundEffectUrl: "/sounds/emjarigindi.mp3", 
+    
+  };
+  console.log(`\n--- Attempting to add "Flying Airplanes" result animation to superlative with order: ${targetOrderForFlightMode} ---`);
+  // UNCOMMENT THE LINE BELOW TO ACTUALLY RUN THIS PART
+  await addResultAnimationToSuperlativeByOrder(targetOrderForFlightMode, flightModeAnimationData);
+
+
   process.exit(0); 
 }
 

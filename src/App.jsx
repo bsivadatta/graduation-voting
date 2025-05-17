@@ -36,6 +36,9 @@ export default function App() {
   const [userType, setUserType] = useState(() => localStorage.getItem(USER_TYPE_STORAGE_KEY) || null);
   const [userId, setUserId] = useState(() => localStorage.getItem(USER_ID_STORAGE_KEY) || null);
 
+  // Ref to track if sound has played for revealed results
+  const soundPlayedForSuperlative = React.useRef({}); // { [superlativeId]: boolean }
+
   // Global game state (synced from Firestore)
   const [superlativesList, setSuperlativesList] = useState([]);
   const [currentQuestionIndex, setCurrentQuestionIndex] = useState(0);
@@ -560,6 +563,33 @@ export default function App() {
     }
   }, [allSuperlativesCompleted, superlativesList.length]); // Rerun if completion state changes or initial list length changes
 
+  // Effect to play sound when winner is revealed
+  useEffect(() => {
+    const winners = getWinner(); // Calculate winners from memoized getWinner
+    const superlativeId = currentSuperlative?.id;
+    const defaultSoundUrl = '/sounds/default-winner-reveal.mp3'; // Default sound
+    
+    const customSoundUrl = currentSuperlative?.resultAnimation?.soundEffectUrl;
+    // Use custom sound if it's a non-empty string after trimming, otherwise use defaultSoundUrl.
+    const soundToPlay = (customSoundUrl && customSoundUrl.trim()) ? customSoundUrl.trim() : defaultSoundUrl;
+
+    if (superlativeId && winners && winners.length > 0) {
+      if (isResultShown && !soundPlayedForSuperlative.current[superlativeId]) {
+        // Play sound effect
+        const audio = new Audio(soundToPlay); 
+        audio.play().catch(error => console.error(`Error playing sound '${soundToPlay}':`, error)); // Enhanced logging
+        
+        soundPlayedForSuperlative.current[superlativeId] = true;
+      } else if (!isResultShown && soundPlayedForSuperlative.current[superlativeId]) {
+        // Reset if results are hidden again, allowing sound to play if re-revealed
+        soundPlayedForSuperlative.current[superlativeId] = false;
+      }
+    }
+    // If navigating away from a question for which sound status was tracked, 
+    // but then coming back, its state in soundPlayedForSuperlative.current will persist as intended.
+    // No specific cleanup needed for a superlativeId that is no longer current, its state remains until next interaction.
+  }, [isResultShown, getWinner, currentSuperlative]); // Added currentSuperlative to deps for resultAnimation check
+
   // --- Render Logic ---
   console.log("[DEBUG App.jsx] Render. userType:", userType);
 
@@ -584,10 +614,11 @@ export default function App() {
       <style>
         {`
           @keyframes inYourFaceAnimation {
-            0% { transform: scale(0.3); opacity: 0; }
-            50% { transform: scale(1.8); opacity: 1; }
-            70% { transform: scale(0.9); }
-            100% { transform: scale(1); opacity: 1; }
+            0% { transform: scale(0.2); opacity: 0; }    /* Start smaller */
+            40% { transform: scale(2.2); opacity: 1; }  /* Pop bigger and earlier */
+            60% { transform: scale(0.8); }             /* Bounce back more significantly */
+            80% { transform: scale(1.1); }             /* Overshoot slightly */
+            100% { transform: scale(1); opacity: 1; }   /* Settle */
           }
           .animate-in-your-face {
             animation-name: inYourFaceAnimation;
@@ -763,27 +794,204 @@ export default function App() {
                       // Default confetti settings
                       let resolvedConfettiProps = {
                         recycle: false,
-                        numberOfPieces: isActuallyTie ? 200 : 400,
+                        numberOfPieces: isActuallyTie ? 500 : 800, 
                         width: dimensions.width,
                         height: dimensions.height,
-                        // You can add more react-confetti default props here
+                        // Reverted to sensible defaults for a central explosion
+                        origin: { x: 0.5, y: 0.5 }, 
+                        angle: 90,                  
+                        spread: 360,                
+                        startVelocity: 50,          
+                        gravity: 0.08,             
+                        scalar: 1.2,                
+                        drift: 0, // Changed global default drift to 0 to reduce flicker                 
+                        colors: ['#f44336', '#e91e63', '#9c27b0', '#673ab7', '#3f51b5', '#2196f3', '#03a9f4', '#00bcd4', '#009688', '#4CAF50', '#8BC34A', '#CDDC39', '#FFEB3B', '#FFC107', '#FF9800', '#FF5722', '#795548'],
+                      };
+
+                      // Helper function to draw a dollar sign
+                      const drawDollarSign = (ctx) => {
+                        const fontSize = 22; // Size of the dollar sign
+                        ctx.font = `bold ${fontSize}px Arial`;
+                        // react-confetti handles cycling through its `colors` prop for fillStyle
+                        const text = '$';
+                        const textMetrics = ctx.measureText(text);
+                        // Center the text. react-confetti draws from the center of the piece.
+                        const actualHeight = textMetrics.actualBoundingBoxAscent + textMetrics.actualBoundingBoxDescent;
+                        ctx.fillText(text, -textMetrics.width / 2, actualHeight / 2);
+                      };
+
+                      // Helper function to draw a "No Drinking" sign
+                      const drawNoDrinkingSign = (ctx) => {
+                        const size = 20; // Overall size of the symbol
+                        const lineWidth = 2.5;
+
+                        // Red circle
+                        ctx.beginPath();
+                        ctx.arc(0, 0, size / 2, 0, 2 * Math.PI, false);
+                        ctx.fillStyle = 'rgba(255, 0, 0, 0.8)'; // Semi-transparent red
+                        ctx.fill();
+                        ctx.lineWidth = lineWidth;
+                        ctx.strokeStyle = 'darkred';
+                        ctx.stroke();
+
+                        // Simple Martini Glass (white or light gray)
+                        ctx.beginPath();
+                        // Cup (inverted triangle)
+                        ctx.moveTo(-size / 5, -size / 5);
+                        ctx.lineTo(size / 5, -size / 5);
+                        ctx.lineTo(0, size / 8);
+                        ctx.closePath();
+                        // Stem
+                        ctx.moveTo(0, size / 8);
+                        ctx.lineTo(0, size / 3);
+                        // Base
+                        ctx.moveTo(-size / 6, size / 3);
+                        ctx.lineTo(size / 6, size / 3);
+                        
+                        ctx.strokeStyle = '#FFFFFF'; // White outline for glass
+                        ctx.lineWidth = lineWidth * 0.8;
+                        ctx.stroke();
+
+                        // Red slash (top-left to bottom-right)
+                        ctx.beginPath();
+                        ctx.moveTo(-size / 2 * 0.7, -size / 2 * 0.7);
+                        ctx.lineTo(size / 2 * 0.7, size / 2 * 0.7);
+                        ctx.strokeStyle = 'darkred';
+                        ctx.lineWidth = lineWidth * 1.2;
+                        ctx.stroke();
+                      };
+
+                      // Helper function to draw just an Airplane
+                      const drawAirplane = (ctx) => {
+                        const size = 22; // Overall size of the symbol
+                        const lineWidth = 2;
+                        ctx.lineWidth = lineWidth;
+                        ctx.fillStyle = 'rgba(75, 85, 99, 0.9)'; // Darker gray for airplane
+                        ctx.strokeStyle = '#333333'; 
+
+                        ctx.beginPath();
+                        // Fuselage
+                        ctx.moveTo(-size * 0.4, 0);
+                        ctx.lineTo(-size * 0.3, -size * 0.1);
+                        ctx.lineTo(size * 0.4, -size * 0.15);
+                        ctx.lineTo(size * 0.45, 0);
+                        ctx.lineTo(size * 0.4, size * 0.15);
+                        ctx.lineTo(-size * 0.3, size * 0.1);
+                        ctx.closePath();
+                        // Wing
+                        ctx.moveTo(-size * 0.15, -size * 0.1);
+                        ctx.lineTo(0, -size * 0.4);
+                        ctx.lineTo(size * 0.1, -size * 0.35);
+                        ctx.lineTo(size * 0.05, -size * 0.1);
+                        // Tail wing
+                        ctx.moveTo(-size * 0.35, 0);
+                        ctx.lineTo(-size * 0.45, -size * 0.2);
+                        ctx.lineTo(-size * 0.4, -size * 0.18);
+                        ctx.fill();
+                        ctx.stroke();
+                      };
+
+                      // Helper function to draw Flight Mode related symbols (Airplane, No Signal, No Wi-Fi)
+                      const drawFlightModeSymbols = (ctx) => {
+                        const size = 22; // Overall size of the symbol
+                        const lineWidth = 2;
+                        ctx.lineWidth = lineWidth;
+                        ctx.fillStyle = 'rgba(100, 100, 100, 0.8)'; // Default fill for symbols
+                        ctx.strokeStyle = '#333333'; // Default stroke for symbols
+
+                        const symbolType = Math.floor(Math.random() * 3); // 0: Airplane, 1: No Signal, 2: No Wi-Fi
+
+                        ctx.beginPath();
+
+                        if (symbolType === 0) { // Airplane
+                          ctx.fillStyle = 'rgba(75, 85, 99, 0.9)'; // Darker gray for airplane
+                          // Fuselage
+                          ctx.moveTo(-size * 0.4, 0);
+                          ctx.lineTo(-size * 0.3, -size * 0.1);
+                          ctx.lineTo(size * 0.4, -size * 0.15);
+                          ctx.lineTo(size * 0.45, 0);
+                          ctx.lineTo(size * 0.4, size * 0.15);
+                          ctx.lineTo(-size * 0.3, size * 0.1);
+                          ctx.closePath();
+                          // Wing
+                          ctx.moveTo(-size * 0.15, -size * 0.1);
+                          ctx.lineTo(0, -size * 0.4);
+                          ctx.lineTo(size * 0.1, -size * 0.35);
+                          ctx.lineTo(size * 0.05, -size * 0.1);
+                          // Tail wing
+                          ctx.moveTo(-size * 0.35, 0);
+                          ctx.lineTo(-size * 0.45, -size * 0.2);
+                          ctx.lineTo(-size * 0.4, -size * 0.18);
+                          ctx.fill();
+                          ctx.stroke();
+                        } else if (symbolType === 1) { // No Signal Bars
+                          const barWidth = size / 6;
+                          const barSpacing = size / 12;
+                          let currentX = -size / 2 + barWidth / 2;
+                          for (let i = 0; i < 4; i++) {
+                            const barHeight = (size / 2) * ((i + 1) / 4);
+                            ctx.rect(currentX, size / 2 - barHeight, barWidth, barHeight);
+                            currentX += barWidth + barSpacing;
+                          }
+                          ctx.fill();
+                          ctx.stroke();
+                          // Red X or Slash over signal bars (optional, can be part of a general "no" symbol)
+                          ctx.beginPath();
+                          ctx.moveTo(-size/2.5, -size/3);
+                          ctx.lineTo(size/2.5, size/3);
+                          ctx.strokeStyle = 'rgba(255, 0, 0, 0.7)';
+                          ctx.lineWidth = lineWidth * 1.5;
+                          ctx.stroke();
+                        } else { // No Wi-Fi Symbol (crossed out)
+                          ctx.strokeStyle = 'rgba(0, 120, 255, 0.8)'; // Blue for Wi-Fi symbol
+                          for (let i = 0; i < 3; i++) {
+                            ctx.beginPath();
+                            const radius = (size / 3) * (i + 1) * 0.4;
+                            ctx.arc(0, size / 2.5, radius, Math.PI * 1.25, Math.PI * 1.75, false);
+                            ctx.stroke();
+                          }
+                           // Red slash
+                          ctx.beginPath();
+                          ctx.moveTo(-size / 2.2, size / 2.2); // from top-left of symbol bounds
+                          ctx.lineTo(size / 2.2, -size / 2.2); // to bottom-right of symbol bounds
+                          ctx.strokeStyle = 'rgba(255, 0, 0, 0.7)';
+                          ctx.lineWidth = lineWidth * 1.5;
+                          ctx.stroke();
+                        }
                       };
 
                       if (currentSuperlative?.resultAnimation) {
                         const customAnim = currentSuperlative.resultAnimation;
                         resolvedConfettiProps.recycle = customAnim.recycle ?? resolvedConfettiProps.recycle;
+                        resolvedConfettiProps.numberOfPieces = customAnim.tieNumberOfPieces ?? customAnim.numberOfPieces ?? resolvedConfettiProps.numberOfPieces;
 
-                        if (isActuallyTie) {
-                          // For a tie, use tieNumberOfPieces if available, then numberOfPieces (general), then default tie pieces
-                          resolvedConfettiProps.numberOfPieces = customAnim.tieNumberOfPieces ?? customAnim.numberOfPieces ?? resolvedConfettiProps.numberOfPieces;
-                        } else { // Single winner
-                          // For a single winner, use numberOfPieces if available, then default single winner pieces
-                          resolvedConfettiProps.numberOfPieces = customAnim.numberOfPieces ?? resolvedConfettiProps.numberOfPieces;
+                        if (customAnim.confettiShape === 'dollar') {
+                          resolvedConfettiProps.drawShape = drawDollarSign;
+                          resolvedConfettiProps.colors = customAnim.colors ?? ['#34D399', '#10B981', '#059669', '#047857']; 
+                        } else if (customAnim.confettiShape === 'noDrinkingSign') { // New shape
+                          resolvedConfettiProps.drawShape = drawNoDrinkingSign;
+                          // Colors for noDrinkingSign are mostly defined in the draw function, 
+                          // but you can override confetti piece colors if needed (e.g. for background pieces)
+                          resolvedConfettiProps.colors = customAnim.colors ?? ['#FF0000', '#FFFFFF']; // Example: Red and White pieces
+                        } else if (customAnim.confettiShape === 'flightModeSymbols') { // New flight mode symbols
+                          resolvedConfettiProps.drawShape = drawFlightModeSymbols;
+                          // Colors for background pieces, symbols have their own internal colors mostly
+                          resolvedConfettiProps.colors = customAnim.colors ?? ['#A0A0A0', '#606060', '#EAEAEA']; 
+                        } else if (customAnim.confettiShape === 'flyingAirplanes') { // New: Only flying airplanes
+                          resolvedConfettiProps.drawShape = drawAirplane;
+                          // For flying airplanes, we typically don't want other colored confetti dots
+                          // Force transparent colors for this specific shape to ensure no default confetti appears
+                          resolvedConfettiProps.colors = ['rgba(0,0,0,0)']; 
+                        } else if (customAnim.colors) {
+                           resolvedConfettiProps.colors = customAnim.colors;
                         }
-                        
-                        // Example for future extension: Allow overriding other confetti props
-                        // if (customAnim.colors) resolvedConfettiProps.colors = customAnim.colors;
-                        // if (customAnim.gravity) resolvedConfettiProps.gravity = customAnim.gravity;
+                        resolvedConfettiProps.origin = customAnim.origin ?? resolvedConfettiProps.origin;
+                        resolvedConfettiProps.angle = customAnim.angle ?? resolvedConfettiProps.angle;
+                        resolvedConfettiProps.spread = customAnim.spread ?? resolvedConfettiProps.spread;
+                        resolvedConfettiProps.startVelocity = customAnim.startVelocity ?? resolvedConfettiProps.startVelocity;
+                        resolvedConfettiProps.gravity = customAnim.gravity ?? resolvedConfettiProps.gravity; 
+                        resolvedConfettiProps.scalar = customAnim.scalar ?? resolvedConfettiProps.scalar;
+                        resolvedConfettiProps.drift = customAnim.drift ?? resolvedConfettiProps.drift;
                       }
                       return <Confetti {...resolvedConfettiProps} />;
                     }
